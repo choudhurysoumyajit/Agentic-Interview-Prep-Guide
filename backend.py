@@ -31,13 +31,14 @@ import uuid
 import difflib
 import functools
 import logging
+import threading
 from urllib.parse import urlparse
 from typing import TypedDict, List, Optional, Annotated
 import operator
 
 import requests
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 from tavily import TavilyClient
 from graphviz import Source
 from docx import Document
@@ -52,9 +53,9 @@ from langgraph.graph import StateGraph, START, END
 # --------------------------------------------------------------------------
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
@@ -68,9 +69,30 @@ logging.basicConfig(
 )
 log = logging.getLogger("backend")
 
+_cancel_event = threading.Event()
+
+
+class PipelineCancelled(Exception):
+    """Raised when the user resets or refreshes during an active pipeline."""
+
+
+def cancel_pipeline() -> None:
+    _cancel_event.set()
+    log.info("Pipeline cancellation requested.")
+
+
+def _check_cancelled() -> None:
+    if _cancel_event.is_set():
+        raise PipelineCancelled("Analysis cancelled by reset or page refresh.")
+
+
+def _start_pipeline() -> None:
+    _cancel_event.clear()
+
 
 def reset_generated_outputs() -> int:
     """Delete generated visuals and interview documents, leaving other files intact."""
+    cancel_pipeline()
     deleted = 0
     generated_files = [
         (ASSETS_DIR, ("diagram_", "image_"), None),
@@ -92,7 +114,12 @@ def reset_generated_outputs() -> int:
 
 
 def validate_config():
-    missing = [name for name, val in [("GROQ_API_KEY", GROQ_API_KEY), ("TAVILY_API_KEY", TAVILY_API_KEY)] if not val]
+    missing = [
+        name for name, val in [
+            ("OPENROUTER_API_KEY", OPENROUTER_API_KEY),
+            ("TAVILY_API_KEY", TAVILY_API_KEY),
+        ] if not val
+    ]
     if missing:
         raise EnvironmentError(
             f"Missing required environment variable(s): {', '.join(missing)}. "
@@ -100,15 +127,22 @@ def validate_config():
         )
 
 
-_groq = None
+_openrouter = None
 _tavily = None
 
 
-def _groq_client() -> Groq:
-    global _groq
-    if _groq is None:
-        _groq = Groq(api_key=GROQ_API_KEY)
-    return _groq
+def _openrouter_client() -> OpenAI:
+    global _openrouter
+    if _openrouter is None:
+        _openrouter = OpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "http://localhost"),
+                "X-Title": os.getenv("OPENROUTER_APP_NAME", "Agentic Interview Prep Guide"),
+            },
+        )
+    return _openrouter
 
 
 def _tavily_client() -> TavilyClient:
@@ -341,9 +375,9 @@ PAGE TEXT:
 
 
 @with_retry()
-def _groq_extract(prompt: str) -> list:
-    resp = _groq_client().chat.completions.create(
-        model=GROQ_MODEL,
+def _llm_extract(prompt: str) -> list:
+    resp = _openrouter_client().chat.completions.create(
+        model=OPENROUTER_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
         max_tokens=2048,
@@ -355,13 +389,14 @@ def run_web_research(company: str, technology: str, num_pages: int) -> list:
     pages = tavily_search_pages(company, technology, num_pages)
     qas = []
     for page in pages:
+        _check_cancelled()
         content = (page.get("raw_content") or page.get("content") or "").strip()[:8000]
         if not content.strip():
             log.warning("Skipping web result without content: %s", page.get("url", ""))
             continue
         url = page.get("url", "")
         try:
-            parsed = _groq_extract(WEB_EXTRACTION_PROMPT.format(
+            parsed = _llm_extract(WEB_EXTRACTION_PROMPT.format(
                 technology=technology, company_context=_company_context(company), content=content,
             ))
         except Exception as exc:  # noqa: BLE001
@@ -404,26 +439,31 @@ def run_youtube_research(company: str, technology: str, num_videos: int) -> list
     videos = youtube_search(query, max_results=num_videos)
     qas = []
     for video in videos:
+        _check_cancelled()
         transcript = youtube_transcript(video["id"])
         if not transcript.strip():
             continue
-        content = transcript[:8000]
-        try:
-            parsed = _groq_extract(YT_EXTRACTION_PROMPT.format(
-                technology=technology, company_context=_company_context(company), content=content,
-            ))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Extraction failed for %s: %s", video["url"], exc)
-            parsed = []
-        for item in parsed:
-            q, a = item.get("question", "").strip(), item.get("answer", "").strip()
-            if q and a:
-                qas.append({
-                    "question": q, "answer": a, "source_type": "youtube", "source_url": video["url"],
-                    "technology": technology, "company": company,
-                    "visual_path": None, "visual_type": None, "visual_caption": None,
-                    "frequency_count": 1, "importance_score": 1,
-                })
+        window_size = 8000
+        starts = sorted({0, max(0, len(transcript) // 2 - window_size // 2), max(0, len(transcript) - window_size)})
+        for start in starts:
+            _check_cancelled()
+            content = transcript[start:start + window_size]
+            try:
+                parsed = _llm_extract(YT_EXTRACTION_PROMPT.format(
+                    technology=technology, company_context=_company_context(company), content=content,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Extraction failed for %s: %s", video["url"], exc)
+                parsed = []
+            for item in parsed:
+                q, a = item.get("question", "").strip(), item.get("answer", "").strip()
+                if q and a:
+                    qas.append({
+                        "question": q, "answer": a, "source_type": "youtube", "source_url": video["url"],
+                        "technology": technology, "company": company,
+                        "visual_path": None, "visual_type": None, "visual_caption": None,
+                        "frequency_count": 1, "importance_score": 1,
+                    })
     log.info("YouTube research: %s / %s -> %d Q&A from %d videos", company, technology, len(qas), len(videos))
     return qas
 
@@ -473,8 +513,8 @@ ANSWER: {answer}
 
 @with_retry(max_attempts=2)
 def _generate_dot(question: str, answer: str) -> str:
-    resp = _groq_client().chat.completions.create(
-        model=GROQ_MODEL,
+    resp = _openrouter_client().chat.completions.create(
+        model=OPENROUTER_MODEL,
         messages=[{"role": "user", "content": DIAGRAM_PROMPT.format(question=question, answer=answer[:1500])}],
         temperature=0.3,
         max_tokens=600,
@@ -504,8 +544,8 @@ TECHNICAL ANSWER:
 
 @with_retry(max_attempts=2)
 def _simplify_answer(question: str, answer: str) -> str:
-    resp = _groq_client().chat.completions.create(
-        model=GROQ_MODEL,
+    resp = _openrouter_client().chat.completions.create(
+        model=OPENROUTER_MODEL,
         messages=[{
             "role": "user",
             "content": PLAIN_LANGUAGE_PROMPT.format(question=question, answer=answer[:3000]),
@@ -702,6 +742,7 @@ def _visualize_node(state: GraphState) -> dict:
     for cr in state["final_results"]:
         new_qas = []
         for qa in cr["consolidated_qas"]:
+            _check_cancelled()
             simplified_qa = dict(qa)
             try:
                 simplified_qa["answer"] = _simplify_answer(qa["question"], qa["answer"])
@@ -713,6 +754,7 @@ def _visualize_node(state: GraphState) -> dict:
 
 
 def _build_document_node(state: GraphState) -> dict:
+    _check_cancelled()
     question_count = sum(len(cr["consolidated_qas"]) for cr in state["final_results"])
     if question_count == 0:
         message = (
@@ -753,6 +795,7 @@ def run_pipeline(companies: list, technologies: list, num_pages: int, on_update=
     Returns the final state dict, which includes 'output_path' and 'final_results'.
     """
     validate_config()
+    _start_pipeline()
     graph = build_graph()
     initial_state = {
         "companies": companies, "technologies": technologies, "num_pages": num_pages,

@@ -221,6 +221,8 @@ if st.session_state.analysis_requested:
                     f"Included in document: {selected_count}."
                 )
                 st.success(f"Document generated for {len(companies)} companie(s) and {len(technologies)} technology(ies).")
+        except backend.PipelineCancelled:
+            st.warning("Analysis cancelled by reset or page refresh. No document was generated.")
         except Exception as e:  # noqa: BLE001
             st.error(f"Something went wrong: {e}")
         finally:
