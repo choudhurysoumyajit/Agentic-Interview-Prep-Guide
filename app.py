@@ -1,10 +1,37 @@
 """app.py — the entire UI. All logic lives in backend.py; this file just calls run_pipeline()."""
 import os
+import base64
+from pathlib import Path
 import streamlit as st
 from streamlit.components.v1 import html
 import backend
 
 st.set_page_config(page_title="Interview Prep Generator", page_icon="🎯", layout="wide")
+background_path = Path(__file__).with_name("background.avif")
+background_data = (
+    base64.b64encode(background_path.read_bytes()).decode()
+    if background_path.exists() else ""
+)
+st.markdown(
+    f"""
+    <style>
+    .stApp {{
+        background-image: linear-gradient(rgba(8, 18, 38, 0.78), rgba(8, 18, 38, 0.88)),
+            url('data:image/avif;base64,{background_data}');
+        background-size: cover;
+        background-attachment: fixed;
+    }}
+    .stApp, .stApp p, .stApp label, .stApp [data-testid="stMarkdownContainer"] {{
+        color: #FFFFFF;
+    }}
+    .stApp h1 {{ color: #FFD166; }}
+    [data-testid="stSidebar"] {{ background: rgba(8, 18, 38, 0.88); }}
+    [data-testid="stSidebar"] * {{ color: #FFFFFF !important; }}
+    .stTextInput input, .stNumberInput input {{ color: #FFFFFF !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("🎯 AI Interview Question Generator")
 st.caption(
     "Multi-agent research across the web and YouTube — consolidated into a "
@@ -216,9 +243,16 @@ if st.session_state.analysis_requested:
                 web_count = sum(len(cr.get("web_qas", [])) for cr in final_results)
                 youtube_count = sum(len(cr.get("youtube_qas", [])) for cr in final_results)
                 selected_count = sum(len(cr.get("consolidated_qas", [])) for cr in final_results)
+                generated_images = sum(
+                    bool(qa.get("visual_path"))
+                    for cr in final_results
+                    for qa in cr.get("consolidated_qas", [])
+                )
+                remaining_images = selected_count - generated_images
                 st.info(
                     f"Questions identified: {web_count} from web and {youtube_count} from YouTube. "
-                    f"Included in document: {selected_count}."
+                    f"Included in document: {selected_count}. "
+                    f"Images generated: {generated_images}; remaining: {remaining_images}."
                 )
                 st.success(f"Document generated for {len(companies)} companie(s) and {len(technologies)} technology(ies).")
         except backend.PipelineCancelled:

@@ -39,6 +39,7 @@ import operator
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
+from google import genai
 from tavily import TavilyClient
 from graphviz import Source
 from docx import Document
@@ -56,6 +57,9 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+TRANSCRIPT_API_URL = "https://youtube-transcript-api-tau-one.vercel.app/transcript"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
@@ -116,10 +120,11 @@ def reset_generated_outputs() -> int:
 def validate_config():
     missing = [
         name for name, val in [
-            ("OPENROUTER_API_KEY", OPENROUTER_API_KEY),
             ("TAVILY_API_KEY", TAVILY_API_KEY),
         ] if not val
     ]
+    if not OPENROUTER_API_KEY and not GEMINI_API_KEY:
+        missing.append("OPENROUTER_API_KEY or GEMINI_API_KEY")
     if missing:
         raise EnvironmentError(
             f"Missing required environment variable(s): {', '.join(missing)}. "
@@ -128,6 +133,7 @@ def validate_config():
 
 
 _openrouter = None
+_gemini = None
 _tavily = None
 
 
@@ -143,6 +149,53 @@ def _openrouter_client() -> OpenAI:
             },
         )
     return _openrouter
+
+
+def _gemini_client() -> genai.Client:
+    global _gemini
+    if _gemini is None:
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not configured.")
+        _gemini = genai.Client(api_key=GEMINI_API_KEY)
+    return _gemini
+
+
+def _generate_text(prompt: str, temperature: float, max_tokens: int) -> str:
+    """Generate text with OpenRouter first and Gemini as the provider fallback."""
+    openrouter_error = None
+    if OPENROUTER_API_KEY:
+        try:
+            response = _openrouter_client().chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if text:
+                return text
+            raise RuntimeError("OpenRouter returned an empty response.")
+        except Exception as exc:  # noqa: BLE001
+            openrouter_error = exc
+            log.warning("OpenRouter failed; trying Gemini fallback: %s", exc)
+
+    if GEMINI_API_KEY:
+        response = _gemini_client().models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={
+                "temperature": temperature,
+                "max_output_tokens": max_tokens,
+            },
+        )
+        text = (response.text or "").strip()
+        if text:
+            return text
+        raise RuntimeError("Gemini returned an empty response.")
+
+    if openrouter_error:
+        raise openrouter_error
+    raise RuntimeError("No LLM provider is configured.")
 
 
 def _tavily_client() -> TavilyClient:
@@ -260,12 +313,41 @@ def youtube_transcript(video_id: str) -> str:
     try:
         # youtube-transcript-api 1.x exposes fetch() on an instance and returns
         # FetchedTranscriptSnippet objects rather than dictionaries.
-        transcript = YouTubeTranscriptApi().fetch(video_id)
+        transcript = YouTubeTranscriptApi().fetch(video_id, languages=("en",))
         return " ".join(snippet.text for snippet in transcript)
     except (TranscriptsDisabled, NoTranscriptFound):
         pass
     except Exception as exc:  # noqa: BLE001
         log.warning("Transcript API failed for %s; trying yt-dlp captions: %s", video_id, exc)
+
+    try:
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        response = requests.post(
+            TRANSCRIPT_API_URL,
+            json={"url": video_url},
+            timeout=30,
+        )
+        response.raise_for_status()
+        transcript = response.json().get("transcript")
+        if isinstance(transcript, str) and transcript.strip():
+            try:
+                decoded = json.loads(transcript)
+            except json.JSONDecodeError:
+                decoded = None
+            malformed = (
+                isinstance(decoded, (dict, list))
+                or transcript.lstrip().startswith(("0:{", "1:{"))
+                or '"$@' in transcript
+            )
+            if malformed:
+                log.warning("Hosted transcript response was not plain text for %s", video_id)
+            else:
+                log.info("Hosted transcript fallback succeeded for %s", video_id)
+                return transcript
+    except requests.RequestException as exc:
+        log.warning("Hosted transcript fallback failed for %s: %s", video_id, exc)
+    except (TypeError, ValueError) as exc:
+        log.warning("Invalid hosted transcript response for %s: %s", video_id, exc)
 
     try:
         ydl_opts = {"quiet": True, "skip_download": True, "no_warnings": True}
@@ -376,13 +458,7 @@ PAGE TEXT:
 
 @with_retry()
 def _llm_extract(prompt: str) -> list:
-    resp = _openrouter_client().chat.completions.create(
-        model=OPENROUTER_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=2048,
-    )
-    return safe_json_list(resp.choices[0].message.content)
+    return safe_json_list(_generate_text(prompt, temperature=0.2, max_tokens=2048))
 
 
 def run_web_research(company: str, technology: str, num_pages: int) -> list:
@@ -513,13 +589,11 @@ ANSWER: {answer}
 
 @with_retry(max_attempts=2)
 def _generate_dot(question: str, answer: str) -> str:
-    resp = _openrouter_client().chat.completions.create(
-        model=OPENROUTER_MODEL,
-        messages=[{"role": "user", "content": DIAGRAM_PROMPT.format(question=question, answer=answer[:1500])}],
+    raw = _generate_text(
+        DIAGRAM_PROMPT.format(question=question, answer=answer[:1500]),
         temperature=0.3,
         max_tokens=600,
     )
-    raw = resp.choices[0].message.content.strip()
     match = re.search(r"digraph[\s\S]*}", raw)
     return match.group(0) if match else ""
 
@@ -544,16 +618,11 @@ TECHNICAL ANSWER:
 
 @with_retry(max_attempts=2)
 def _simplify_answer(question: str, answer: str) -> str:
-    resp = _openrouter_client().chat.completions.create(
-        model=OPENROUTER_MODEL,
-        messages=[{
-            "role": "user",
-            "content": PLAIN_LANGUAGE_PROMPT.format(question=question, answer=answer[:3000]),
-        }],
+    simplified = _generate_text(
+        PLAIN_LANGUAGE_PROMPT.format(question=question, answer=answer[:3000]),
         temperature=0.2,
         max_tokens=1000,
     )
-    simplified = (resp.choices[0].message.content or "").strip()
     return simplified or answer
 
 
@@ -739,6 +808,9 @@ def _consolidate_node(state: GraphState) -> dict:
 
 def _visualize_node(state: GraphState) -> dict:
     updated = []
+    total_images = sum(len(cr["consolidated_qas"]) for cr in state["final_results"])
+    generated_images = 0
+    logs = []
     for cr in state["final_results"]:
         new_qas = []
         for qa in cr["consolidated_qas"]:
@@ -748,9 +820,20 @@ def _visualize_node(state: GraphState) -> dict:
                 simplified_qa["answer"] = _simplify_answer(qa["question"], qa["answer"])
             except Exception as exc:  # noqa: BLE001
                 log.warning("Plain-language rewrite failed for %s: %s", qa["question"], exc)
-            new_qas.append(add_visual(simplified_qa))
+            visualized_qa = add_visual(simplified_qa)
+            if visualized_qa.get("visual_path"):
+                generated_images += 1
+            logs.append(
+                f"Images generated: {generated_images}/{total_images} "
+                f"({total_images - generated_images} remaining)."
+            )
+            new_qas.append(visualized_qa)
         updated.append({**cr, "consolidated_qas": new_qas})
-    return {"final_results": updated, "log": ["Visualization complete."]}
+    logs.append(
+        f"Image generation complete: {generated_images} generated, "
+        f"{total_images - generated_images} remaining."
+    )
+    return {"final_results": updated, "log": logs}
 
 
 def _build_document_node(state: GraphState) -> dict:
