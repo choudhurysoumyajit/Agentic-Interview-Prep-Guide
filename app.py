@@ -27,7 +27,12 @@ st.markdown(
     .stApp h1 {{ color: #FFD166; }}
     [data-testid="stSidebar"] {{ background: rgba(8, 18, 38, 0.88); }}
     [data-testid="stSidebar"] * {{ color: #FFFFFF !important; }}
-    .stTextInput input, .stNumberInput input {{ color: #FFFFFF !important; }}
+    .stTextInput input, .stNumberInput input {{
+        color: #0B2D5C !important;
+        background-color: #FFFFFF !important;
+        caret-color: #0B2D5C !important;
+    }}
+    .stTextInput input::placeholder {{ color: #54708F !important; opacity: 1; }}
     </style>
     """,
     unsafe_allow_html=True,
