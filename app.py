@@ -27,14 +27,23 @@ st.markdown(
     .stApp h1 {{ color: #FFD166; }}
     [data-testid="stSidebar"] {{ background: rgba(8, 18, 38, 0.88); }}
     [data-testid="stSidebar"] * {{ color: #FFFFFF !important; }}
+    [data-testid="stSidebar"] div[data-testid="stButton"]:first-of-type button {{
+        background-color: #04AA6D !important;
+        color: #FFFFFF !important;
+        border-color: #04AA6D !important;
+    }}
+    [data-testid="stSidebar"] div[data-testid="stButton"]:first-of-type button:hover {{
+        background-color: #038a59 !important;
+        border-color: #038a59 !important;
+    }}
     [data-testid="stSidebar"] div[data-testid="stButton"]:last-of-type button {{
-        background-color: #e7e7e7 !important;
-        color: #0B2D5C !important;
-        border-color: #e7e7e7 !important;
+        background-color: #f44336 !important;
+        color: #FFFFFF !important;
+        border-color: #f44336 !important;
     }}
     [data-testid="stSidebar"] div[data-testid="stButton"]:last-of-type button:hover {{
-        background-color: #d4d4d4 !important;
-        border-color: #d4d4d4 !important;
+        background-color: #d32f2f !important;
+        border-color: #d32f2f !important;
     }}
     .stTextInput input, .stNumberInput input {{
         color: #0B2D5C !important;
