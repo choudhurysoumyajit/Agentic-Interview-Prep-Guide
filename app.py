@@ -27,6 +27,15 @@ st.markdown(
     .stApp h1 {{ color: #FFD166; }}
     [data-testid="stSidebar"] {{ background: rgba(8, 18, 38, 0.88); }}
     [data-testid="stSidebar"] * {{ color: #FFFFFF !important; }}
+    [data-testid="stSidebar"] div[data-testid="stButton"]:last-of-type button {{
+        background-color: #e7e7e7 !important;
+        color: #0B2D5C !important;
+        border-color: #e7e7e7 !important;
+    }}
+    [data-testid="stSidebar"] div[data-testid="stButton"]:last-of-type button:hover {{
+        background-color: #d4d4d4 !important;
+        border-color: #d4d4d4 !important;
+    }}
     .stTextInput input, .stNumberInput input {{
         color: #0B2D5C !important;
         background-color: #FFFFFF !important;
